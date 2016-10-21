@@ -41,7 +41,7 @@ namespace ConvertToAutoPropertyCS
 
             context.RegisterRefactoring(
                 new ConvertToAutoPropertyCodeAction("Convert to auto property",
-                                                    (c) => ConvertToAutoPropertyAsync(document, propertyDeclaration, c)));
+                                                    c => ConvertToAutoPropertyAsync(document, propertyDeclaration, c)));
         }
 
         /// <summary>
@@ -49,7 +49,7 @@ namespace ConvertToAutoPropertyCS
         /// </summary>
         private static bool HasBothAccessors(BasePropertyDeclarationSyntax property)
         {
-            var accessors = property.AccessorList.Accessors;
+            var accessors = property.AccessorList.Accessors.AsEnumerable();
             var getter = accessors.FirstOrDefault(ad => ad.Kind() == SyntaxKind.GetAccessorDeclaration);
             var setter = accessors.FirstOrDefault(ad => ad.Kind() == SyntaxKind.SetAccessorDeclaration);
 
@@ -64,8 +64,8 @@ namespace ConvertToAutoPropertyCS
 
         private async Task<Document> ConvertToAutoPropertyAsync(Document document, PropertyDeclarationSyntax property, CancellationToken cancellationToken)
         {
-            var tree = (SyntaxTree)await document.GetSyntaxTreeAsync(cancellationToken).ConfigureAwait(false);
-            var semanticModel = (SemanticModel)await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
+            var tree = await document.GetSyntaxTreeAsync(cancellationToken).ConfigureAwait(false);
+            var semanticModel = await document.GetSemanticModelAsync(cancellationToken).ConfigureAwait(false);
 
             // Retrieves the get accessor declarations of the specified property.
             var getter = property.AccessorList.Accessors.FirstOrDefault(ad => ad.Kind() == SyntaxKind.GetAccessorDeclaration);
@@ -76,12 +76,23 @@ namespace ConvertToAutoPropertyCS
             // Find the backing field of the property
             var backingField = await GetBackingFieldAsync(document, getter, containingType, cancellationToken).ConfigureAwait(false);
 
+            // Find the symbols where the field is declared (Normally only on one place for fields)
+            var backingFieldSymbolTasks = backingField.DeclaringSyntaxReferences.Select(r => r.GetSyntaxAsync(cancellationToken));
+            var backingFieldSymbols = await Task.WhenAll(backingFieldSymbolTasks).ConfigureAwait(false);
+
+            // Get the root node and mark the nodes we need to find again after rewrite
+            var root = await tree.GetRootAsync(cancellationToken).ConfigureAwait(false);
+            root.TrackNodes(backingFieldSymbols);
+
             // Rewrite property
             var propertyRewriter = new PropertyRewriter(semanticModel, backingField, property);
-            var root = await tree.GetRootAsync(cancellationToken).ConfigureAwait(false);
-            var newRoot = propertyRewriter.Visit(root);
+            var propertyReplacedRoot = propertyRewriter.Visit(root);
 
-            return document.WithSyntaxRoot(newRoot);
+            // Find the field nodes after rewrite and remove them
+            var backingFieldSymbolsAfterRewrite = propertyReplacedRoot.GetCurrentNodes(backingFieldSymbols.AsEnumerable()).ToArray();
+            var fieldRemovedRoot = propertyReplacedRoot.RemoveNodes(backingFieldSymbolsAfterRewrite, SyntaxRemoveOptions.KeepNoTrivia);
+
+            return document.WithSyntaxRoot(fieldRemovedRoot);
         }
 
         private async Task<ISymbol> GetBackingFieldAsync(Document document, AccessorDeclarationSyntax getter, INamedTypeSymbol containingType, CancellationToken cancellationToken)
